@@ -1,0 +1,172 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --color-background: #f7f8fa;
+  --color-surface: #ffffff;
+  --color-muted: #f0f2f5;
+  --color-border: #d9dee7;
+  --color-ink: #17202a;
+  --color-subtle: #667085;
+}
+
+.dark {
+  color-scheme: dark;
+  --color-background: #05070b;
+  --color-surface: #111827;
+  --color-muted: #1f2937;
+  --color-border: #374151;
+  --color-ink: #f9fafb;
+  --color-subtle: #cbd5e1;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-ink);
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+table {
+  border-spacing: 0;
+}
+
+.dark .bg-white {
+  background-color: #111827 !important;
+}
+
+.dark .bg-background {
+  background-color: var(--color-background) !important;
+}
+
+.dark .bg-surface {
+  background-color: var(--color-surface) !important;
+}
+
+.dark .bg-muted {
+  background-color: var(--color-muted) !important;
+}
+
+.dark .text-ink {
+  color: var(--color-ink) !important;
+}
+
+.dark .text-subtle {
+  color: var(--color-subtle) !important;
+}
+
+.dark .border-border {
+  border-color: var(--color-border) !important;
+}
+
+.dark input,
+.dark select,
+.dark textarea {
+  background-color: #0f172a;
+  color: #f9fafb;
+  border-color: #475569;
+}
+
+.dark input::placeholder,
+.dark textarea::placeholder {
+  color: #94a3b8;
+}
+
+.dark .shadow-soft {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45) !important;
+}
+
+.dark .hover\:bg-muted:hover,
+.dark .hover\:bg-border:hover,
+.dark .hover\:bg-muted\/50:hover {
+  background-color: #263244 !important;
+}
+
+.dark .hover\:bg-blue-50:hover {
+  background-color: #172554 !important;
+}
+
+.dark .bg-green-50,
+.dark .bg-green-50\/60 {
+  background-color: rgba(20, 83, 45, 0.38) !important;
+}
+
+.dark .bg-red-50,
+.dark .bg-red-50\/60 {
+  background-color: rgba(127, 29, 29, 0.42) !important;
+}
+
+.dark .bg-yellow-50,
+.dark .bg-yellow-50\/60,
+.dark .bg-yellow-100 {
+  background-color: rgba(113, 63, 18, 0.5) !important;
+}
+
+.dark .text-yellow-800 {
+  color: #fde68a !important;
+}
+
+.dark .bg-successSoft {
+  background-color: rgba(22, 101, 52, 0.45) !important;
+}
+
+.dark .bg-dangerSoft,
+.dark .bg-dangerSoft\/40 {
+  background-color: rgba(127, 29, 29, 0.48) !important;
+}
+
+.dark .text-danger {
+  color: #fca5a5 !important;
+}
+
+.dark .text-success {
+  color: #86efac !important;
+}
+
+.dark .bg-white\/60,
+.dark .bg-white\/70 {
+  background-color: rgba(15, 23, 42, 0.78) !important;
+}
+
+.dark .calendar-day-cell {
+  color: #f9fafb;
+  background-color: var(--color-surface);
+}
+
+.dark .calendar-day-number {
+  background-color: rgba(15, 23, 42, 0.85);
+  color: #f9fafb !important;
+}
+
+.dark .calendar-entry-badge,
+.dark .calendar-split-section {
+  background-color: rgba(15, 23, 42, 0.88) !important;
+  color: #f9fafb !important;
+  border-color: #475569 !important;
+}
+
+.dark .calendar-entry-badge .text-subtle,
+.dark .calendar-split-section .text-subtle {
+  color: #cbd5e1 !important;
+}
+
+nextjs-portal,
+[data-nextjs-dev-overlay],
+[data-next-badge-root] {
+  display: none !important;
+}
