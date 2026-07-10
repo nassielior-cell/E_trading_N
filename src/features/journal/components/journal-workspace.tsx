@@ -103,6 +103,7 @@ export function JournalWorkspace() {
   const [areSummariesReady, setAreSummariesReady] = useState(false);
   const [isSlowJournalLoad, setIsSlowJournalLoad] = useState(false);
   const [hasEntryLoadingTimedOut, setHasEntryLoadingTimedOut] = useState(false);
+  const [currentSearch, setCurrentSearch] = useState('');
   const hasAppliedUrlWorkspaceRef = useRef(false);
   const days = useJournalStore((state) => state.days);
   const tasks = useJournalStore((state) => state.tasks);
@@ -125,16 +126,57 @@ export function JournalWorkspace() {
   const createNewJournal = useJournalStore((state) => state.createNewJournal);
   const accountValueResets = useJournalStore((state) => state.accountValueResets);
   const isViewOnly = useJournalStore((state) => state.isViewOnly);
-  const setAccessMode = useJournalStore((state) => state.setAccessMode);
+  const accessMode = useJournalStore((state) => state.accessMode);
+  const sharePermission = useJournalStore((state) => state.sharePermission);
+  const shareCode = useJournalStore((state) => state.shareCode);
+  const sharedOwnerId = useJournalStore((state) => state.sharedOwnerId);
   const initializeCloudSync = useJournalStore((state) => state.initializeCloudSync);
+  const initializeSharedJournal = useJournalStore((state) => state.initializeSharedJournal);
   const resetCloudJournalState = useJournalStore((state) => state.resetCloudJournalState);
   const previousUserIdRef = useRef<string | undefined>(undefined);
+  const urlParams = useMemo(() => new URLSearchParams(currentSearch), [currentSearch]);
+  const urlShareCode = urlParams.get('shareCode');
+  const hasSharedUrlParams = Boolean(urlShareCode);
+  const isSharedJournal = accessMode === 'viewer' && Boolean(sharedOwnerId && sharePermission);
 
   useEffect(() => {
     const today = getTodayDateKey();
     setIsClientReady(true);
     setSelectedDate((current) => current || today);
     setMonthDate(new Date(`${today}T00:00:00`));
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const updateSearch = () => setCurrentSearch(window.location.search);
+    const originalPushState = window.history.pushState;
+    const originalReplaceState = window.history.replaceState;
+
+    window.history.pushState = function pushState(...args) {
+      const result = originalPushState.apply(this, args);
+      window.dispatchEvent(new Event('e-trading-n:url-change'));
+      return result;
+    };
+
+    window.history.replaceState = function replaceState(...args) {
+      const result = originalReplaceState.apply(this, args);
+      window.dispatchEvent(new Event('e-trading-n:url-change'));
+      return result;
+    };
+
+    updateSearch();
+    scrubLegacyViewerModeStorage(window.localStorage);
+    scrubLegacyViewerModeStorage(window.sessionStorage);
+    window.addEventListener('popstate', updateSearch);
+    window.addEventListener('e-trading-n:url-change', updateSearch);
+
+    return () => {
+      window.history.pushState = originalPushState;
+      window.history.replaceState = originalReplaceState;
+      window.removeEventListener('popstate', updateSearch);
+      window.removeEventListener('e-trading-n:url-change', updateSearch);
+    };
   }, []);
 
   useEffect(() => {
@@ -153,11 +195,47 @@ export function JournalWorkspace() {
   }, [isAuthReady, resetCloudJournalState, user?.uid]);
 
   useEffect(() => {
+    if (!isAuthReady || !user?.uid || hasSharedUrlParams) return;
+    if (!shareCode && !isSharedJournal) return;
+
+    resetCloudJournalState(user.uid);
+    setHasSelectedCloudJournal(false);
+    setIsOpeningRememberedJournal(false);
+    setIsSettingsOpen(false);
+    setSettingsInitialSection(null);
+    hasAppliedUrlWorkspaceRef.current = false;
+  }, [hasSharedUrlParams, isAuthReady, isSharedJournal, resetCloudJournalState, shareCode, user?.uid]);
+
+  useEffect(() => {
     let isMounted = true;
     const rememberedJournalId = user?.uid ? getRememberedJournalSelection(user.uid) : null;
 
     if (!isAuthReady) {
       return;
+    }
+
+    if (user?.uid && urlShareCode) {
+      setIsOpeningRememberedJournal(true);
+      void withTimeout(
+        initializeSharedJournal(user.uid, urlShareCode),
+        JOURNAL_OPEN_TIMEOUT_MS,
+        'shared journal open timed out',
+      )
+        .then((didOpen) => {
+          if (!isMounted) return;
+          setHasSelectedCloudJournal(didOpen);
+        })
+        .catch(() => {
+          if (!isMounted) return;
+          setHasSelectedCloudJournal(false);
+        })
+        .finally(() => {
+          if (isMounted) setIsOpeningRememberedJournal(false);
+        });
+
+      return () => {
+        isMounted = false;
+      };
     }
 
     if (!user?.uid || !rememberedJournalId) {
@@ -187,9 +265,11 @@ export function JournalWorkspace() {
     return () => {
       isMounted = false;
     };
-  }, [initializeCloudSync, isAuthReady, user?.uid]);
+  }, [initializeCloudSync, initializeSharedJournal, isAuthReady, urlShareCode, user?.uid]);
 
   useEffect(() => {
+    if (isSharedJournal) return;
+
     if (user?.uid && hasSelectedCloudJournal && journals.some((journal) => journal.workspaceId === workspaceId)) {
       rememberJournalSelection(user.uid, workspaceId);
     }
@@ -202,17 +282,21 @@ export function JournalWorkspace() {
       forgetRememberedJournalSelection(user.uid);
       setHasSelectedCloudJournal(false);
     }
-  }, [hasSelectedCloudJournal, journals, syncStatus, user?.uid, workspaceId]);
+  }, [hasSelectedCloudJournal, isSharedJournal, journals, syncStatus, user?.uid, workspaceId]);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    setAccessMode(params.get('mode') === 'viewer' ? 'viewer' : 'owner');
-  }, [setAccessMode]);
+    hasAppliedUrlWorkspaceRef.current = false;
+  }, [currentSearch]);
 
   useEffect(() => {
     if (!isClientReady || hasAppliedUrlWorkspaceRef.current) return;
 
-    const requestedWorkspace = new URLSearchParams(window.location.search).get('workspace');
+    if (hasSharedUrlParams) {
+      hasAppliedUrlWorkspaceRef.current = true;
+      return;
+    }
+
+    const requestedWorkspace = urlParams.get('workspace');
     if (!requestedWorkspace) {
       hasAppliedUrlWorkspaceRef.current = true;
       return;
@@ -230,7 +314,7 @@ export function JournalWorkspace() {
     if (requestedWorkspace === workspaceId || journals.length) {
       hasAppliedUrlWorkspaceRef.current = true;
     }
-  }, [isClientReady, journals, switchJournal, workspaceId]);
+  }, [hasSharedUrlParams, isClientReady, journals, switchJournal, urlParams, workspaceId]);
 
   const visibleDays = useMemo(() => (isClientReady ? days : {}), [days, isClientReady]);
   const visibleTasks = useMemo(() => (isClientReady ? tasks : {}), [isClientReady, tasks]);
@@ -391,7 +475,7 @@ export function JournalWorkspace() {
           <div className="min-w-0">
             <p className="text-xs font-bold uppercase tracking-wide text-subtle">{t('webFoundation')}</p>
             <div className="flex flex-wrap items-center gap-2">
-              {isEditingJournalName && !isViewOnly ? (
+              {isEditingJournalName && !isSharedJournal ? (
                 <input
                   autoFocus
                   className="min-h-10 max-w-full rounded-md border border-border bg-surface px-3 py-1 text-2xl font-bold leading-tight text-ink outline-none focus:border-primary focus:ring-2 focus:ring-blue-100 sm:text-3xl"
@@ -409,13 +493,15 @@ export function JournalWorkspace() {
                   defaultValue={journalName}
                 />
               ) : (
-                <button className="break-words text-start text-2xl font-bold leading-tight text-ink sm:text-3xl" disabled={isViewOnly} onClick={() => setIsEditingJournalName(true)} type="button">
+                <button className="break-words text-start text-2xl font-bold leading-tight text-ink sm:text-3xl" disabled={isSharedJournal} onClick={() => setIsEditingJournalName(true)} type="button">
                   {journalName || t('appTitle')}
                 </button>
               )}
-              {isViewOnly ? (
+              {isSharedJournal ? (
                 <span className="rounded-md bg-muted px-2 py-1 text-xs font-bold uppercase text-subtle">
-                  {language === 'he' ? 'צפייה בלבד' : 'View Only'}
+                  {sharePermission === 'edit'
+                    ? language === 'he' ? 'שיתוף: עריכה' : 'Shared Edit'
+                    : language === 'he' ? 'צפייה בלבד' : 'View Only'}
                 </span>
               ) : null}
             </div>
@@ -423,7 +509,9 @@ export function JournalWorkspace() {
           <div className="grid grid-cols-1 gap-2 min-[420px]:grid-cols-2 sm:grid-cols-3 md:flex md:flex-wrap md:items-center">
             <Link
               className="inline-flex min-h-10 items-center justify-center rounded-md bg-muted px-4 py-2 text-sm font-semibold text-ink transition hover:bg-border"
-              href={`/statistics?workspace=${encodeURIComponent(workspaceId)}`}
+              href={isSharedJournal && shareCode
+                ? `/statistics?shareCode=${encodeURIComponent(shareCode)}`
+                : `/statistics?workspace=${encodeURIComponent(workspaceId)}`}
             >
               {t('customStatistics')}
             </Link>
@@ -454,7 +542,7 @@ export function JournalWorkspace() {
               <span>{language === 'he' ? 'תמיכה' : 'Support'}</span>
             </button>
             <Button
-              disabled={isViewOnly}
+              disabled={false}
               onClick={() => {
                 setSettingsInitialAccountMode(undefined);
                 setIsSettingsOpen(true);
@@ -566,7 +654,7 @@ export function JournalWorkspace() {
           </section>
         ) : null}
 
-        {journals.length ? (
+        {journals.length && !isSharedJournal ? (
           <section className="grid gap-2 rounded-lg border border-border bg-surface p-3 shadow-soft sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
             <label className="grid gap-1 text-sm font-semibold text-ink">
               {language === 'he' ? 'בחירת יומן' : 'Journal switcher'}
@@ -583,14 +671,14 @@ export function JournalWorkspace() {
               </select>
             </label>
           </section>
-        ) : (
+        ) : !isSharedJournal ? (
           <section className="grid gap-2 rounded-lg border border-border bg-surface p-3 shadow-soft">
             <p className="text-sm font-bold text-ink">{language === 'he' ? 'אין יומנים קיימים' : 'No journals yet'}</p>
             <Button onClick={() => setHasSelectedCloudJournal(false)} type="button" variant="secondary">
               {language === 'he' ? 'צור יומן חדש' : 'Create New Journal'}
             </Button>
           </section>
-        )}
+        ) : null}
 
         <AccountValueModePanel accountValueResets={accountValueResets} date={selectedDate} journalType={journalType} language={language} spots={spotsForSummaries} trades={tradesForSummaries} />
 
@@ -820,7 +908,7 @@ export function JournalWorkspace() {
         initialAccountMode={settingsInitialAccountMode}
         initialSection={settingsInitialSection}
         isOpen={isSettingsOpen}
-        isReadOnly={isViewOnly}
+        isReadOnly={isSharedJournal || isViewOnly}
         onClose={() => {
           setIsSettingsOpen(false);
           setSettingsInitialSection(null);
@@ -1267,6 +1355,35 @@ function PostLoginJournalGate({
 
 function isValidJournalId(value: string) {
   return Boolean(value && !value.includes('/') && value !== '.' && value !== '..');
+}
+
+function scrubLegacyViewerModeStorage(storage: Storage) {
+  const legacyKeys = [
+    'e_trading_n:v1:access-mode',
+    'e_trading_n:v1:viewer-mode',
+    'e_trading_n:v1:share',
+    'e_trading_n:v1:shared-journal',
+  ];
+
+  legacyKeys.forEach((key) => storage.removeItem(key));
+
+  const journalKey = 'e_trading_n:v1:journal';
+  const rawJournal = storage.getItem(journalKey);
+  if (!rawJournal) return;
+
+  try {
+    const parsed = JSON.parse(rawJournal) as Record<string, unknown>;
+    if (!('accessMode' in parsed) && !('isViewOnly' in parsed) && !('shareCode' in parsed) && !('sharedOwnerId' in parsed)) return;
+
+    delete parsed.accessMode;
+    delete parsed.isViewOnly;
+    delete parsed.shareCode;
+    delete parsed.sharedOwnerId;
+    delete parsed.sharePermission;
+    storage.setItem(journalKey, JSON.stringify(parsed));
+  } catch {
+    // Preserve the journal cache if it is not JSON; the repository fallback handles it.
+  }
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

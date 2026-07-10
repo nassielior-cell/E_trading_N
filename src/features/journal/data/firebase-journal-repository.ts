@@ -5,6 +5,7 @@ import {
   getDoc,
   getDocs,
   onSnapshot,
+  setDoc,
   writeBatch,
   type Unsubscribe,
 } from 'firebase/firestore';
@@ -43,6 +44,21 @@ type EntryDocument =
 type ActiveContext = {
   userId?: string;
   journalId: string;
+  ownerId?: string;
+  shareCode?: string;
+  sharePermission?: SharePermission;
+};
+
+export type SharePermission = 'view' | 'edit';
+
+export type JournalShareRecord = {
+  shareCode: string;
+  ownerId: string;
+  journalId: string;
+  permission: SharePermission;
+  sharedWith: 'anyoneWithLink' | string[];
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type FirebaseJournalRepository = {
@@ -61,6 +77,11 @@ export type FirebaseJournalRepository = {
   setUser: (userId: string) => void;
   clearUser: () => void;
   setActiveJournal: (journalId: string) => void;
+  clearSharedJournal: () => void;
+  setSharedJournal: (share: Pick<JournalShareRecord, 'shareCode' | 'ownerId' | 'journalId' | 'permission'>) => void;
+  createShare: (permission: SharePermission, journalId?: string) => Promise<JournalShareRecord>;
+  resolveShare: (shareCode: string) => Promise<JournalShareRecord | null>;
+  claimShare: (share: Pick<JournalShareRecord, 'shareCode' | 'ownerId' | 'journalId' | 'permission'>) => Promise<void>;
   listJournals: () => Promise<JournalSummary[]>;
   deleteJournal: (journalId?: string) => Promise<JournalSummary[]>;
   load: (journalId?: string) => Promise<JournalSnapshot | null>;
@@ -80,18 +101,41 @@ export const firebaseJournalRepository: FirebaseJournalRepository = {
   setUser: (userId) => {
     context.userId = userId;
     firebaseJournalRepository.userId = userId;
-    firebaseJournalRepository.paths = buildPaths(userId, context.journalId);
+    firebaseJournalRepository.paths = buildPaths(getEffectiveOwnerId(), context.journalId);
   },
   clearUser: () => {
     context.userId = undefined;
+    context.ownerId = undefined;
+    context.shareCode = undefined;
+    context.sharePermission = undefined;
     firebaseJournalRepository.userId = undefined;
     firebaseJournalRepository.paths = buildPaths(undefined, context.journalId);
   },
   setActiveJournal: (journalId) => {
+    context.ownerId = undefined;
+    context.shareCode = undefined;
+    context.sharePermission = undefined;
     context.journalId = journalId || defaultJournalId;
     firebaseJournalRepository.workspaceId = context.journalId;
     firebaseJournalRepository.paths = buildPaths(context.userId, context.journalId);
   },
+  clearSharedJournal: () => {
+    context.ownerId = undefined;
+    context.shareCode = undefined;
+    context.sharePermission = undefined;
+    firebaseJournalRepository.paths = buildPaths(context.userId, context.journalId);
+  },
+  setSharedJournal: (share) => {
+    context.ownerId = share.ownerId;
+    context.shareCode = share.shareCode;
+    context.sharePermission = share.permission;
+    context.journalId = share.journalId || defaultJournalId;
+    firebaseJournalRepository.workspaceId = context.journalId;
+    firebaseJournalRepository.paths = buildPaths(share.ownerId, context.journalId);
+  },
+  createShare: createFirebaseShare,
+  resolveShare: resolveFirebaseShare,
+  claimShare: claimFirebaseShare,
   listJournals,
   deleteJournal: deleteFirebaseJournal,
   load: loadFirebaseSnapshot,
@@ -128,6 +172,91 @@ async function listJournals() {
     .sort((a, b) => b.savedAt.localeCompare(a.savedAt));
 }
 
+async function createFirebaseShare(permission: SharePermission, requestedJournalId?: string) {
+  if (!firestore || !context.userId) {
+    throw new Error('Sign in required to share this journal.');
+  }
+
+  const journalId = requestedJournalId || context.journalId || defaultJournalId;
+  if (!isValidJournalId(journalId)) {
+    throw new Error(`Invalid journal id: ${journalId}`);
+  }
+
+  const shareCode = await createUniqueShareCode();
+  const now = new Date().toISOString();
+  const share: JournalShareRecord = {
+    shareCode,
+    ownerId: context.userId,
+    journalId,
+    permission,
+    sharedWith: 'anyoneWithLink',
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await setDoc(doc(firestore, 'shares', shareCode), removeUndefined({
+    ...share,
+    active: true,
+    createdBy: context.userId,
+  }));
+
+  console.info(logPrefix, 'share created', {
+    shareCode,
+    ownerId: context.userId,
+    journalId,
+    permission,
+  });
+
+  return share;
+}
+
+async function resolveFirebaseShare(shareCode: string) {
+  if (!firestore || !isValidShareCode(shareCode)) return null;
+
+  const shareDoc = await getDoc(doc(firestore, 'shares', shareCode));
+  if (!shareDoc.exists()) return null;
+
+  const data = shareDoc.data();
+  if (
+    typeof data.ownerId !== 'string' ||
+    typeof data.journalId !== 'string' ||
+    data.active === false ||
+    !isValidJournalId(data.journalId) ||
+    !isValidUserId(data.ownerId)
+  ) {
+    return null;
+  }
+
+  const permission: SharePermission = data.permission === 'edit' ? 'edit' : 'view';
+
+  return {
+    shareCode,
+    ownerId: data.ownerId,
+    journalId: data.journalId,
+    permission,
+    sharedWith: Array.isArray(data.sharedWith) ? data.sharedWith.filter((value): value is string => typeof value === 'string') : 'anyoneWithLink',
+    createdAt: typeof data.createdAt === 'string' ? data.createdAt : new Date(0).toISOString(),
+    updatedAt: typeof data.updatedAt === 'string' ? data.updatedAt : new Date(0).toISOString(),
+  } satisfies JournalShareRecord;
+}
+
+async function claimFirebaseShare(share: Pick<JournalShareRecord, 'shareCode' | 'ownerId' | 'journalId' | 'permission'>) {
+  if (!firestore || !context.userId) {
+    throw new Error('Sign in required to open a shared journal.');
+  }
+
+  const now = new Date().toISOString();
+  await setDoc(doc(firestore, 'users', share.ownerId, 'journals', share.journalId, 'accessGrants', context.userId), removeUndefined({
+    viewerId: context.userId,
+    ownerId: share.ownerId,
+    journalId: share.journalId,
+    shareCode: share.shareCode,
+    permission: share.permission,
+    createdAt: now,
+    updatedAt: now,
+  }), { merge: true });
+}
+
 async function loadFirebaseSnapshot(journalId = context.journalId) {
   if (!firestore || !context.userId) {
     console.info(logPrefix, 'load skipped: Firestore/Auth is not configured');
@@ -138,9 +267,11 @@ async function loadFirebaseSnapshot(journalId = context.journalId) {
     throw new Error(`Invalid journal id: ${journalId}`);
   }
 
-  const journalRef = getJournalRef(context.userId, journalId);
+  const ownerId = getEffectiveOwnerId();
+  const journalRef = getJournalRef(ownerId, journalId);
   console.info(logPrefix, 'load start', {
     userId: context.userId,
+    ownerId,
     journalId,
     journalPath: journalRef.path,
   });
@@ -149,6 +280,7 @@ async function loadFirebaseSnapshot(journalId = context.journalId) {
   if (!journalDoc.exists()) {
     console.info(logPrefix, 'load success: journal document does not exist', {
       userId: context.userId,
+      ownerId,
       journalId,
       journalPath: journalRef.path,
     });
@@ -159,6 +291,7 @@ async function loadFirebaseSnapshot(journalId = context.journalId) {
   if (journalData.isDeleted === true || journalData.deletedAt) {
     console.info(logPrefix, 'load success: journal document is deleted', {
       userId: context.userId,
+      ownerId,
       journalId,
       journalPath: journalRef.path,
     });
@@ -175,6 +308,7 @@ async function loadFirebaseSnapshot(journalId = context.journalId) {
 
   console.info(logPrefix, 'load success', {
     userId: context.userId,
+    ownerId,
     journalId,
     journalPath: journalRef.path,
     entriesPath: entriesRef.path,
@@ -194,14 +328,17 @@ async function saveFirebaseSnapshot(snapshot: JournalSnapshot) {
   }
 
   const journalId = snapshot.workspaceId || context.journalId || defaultJournalId;
-  const journalRef = getJournalRef(context.userId, journalId);
+  const ownerId = getEffectiveOwnerId();
+  const journalRef = getJournalRef(ownerId, journalId);
   const entriesRef = collection(journalRef, 'entries');
   const existingEntries = await getDocs(entriesRef);
   const batch = writeBatch(firestore);
   const savedAt = new Date().toISOString();
+  const isOwnerWrite = !context.ownerId || context.ownerId === context.userId;
 
   console.info(logPrefix, 'write start', {
     userId: context.userId,
+    ownerId,
     journalId,
     journalPath: journalRef.path,
     entriesPath: entriesRef.path,
@@ -211,38 +348,58 @@ async function saveFirebaseSnapshot(snapshot: JournalSnapshot) {
     days: Object.keys(snapshot.days).length,
   });
 
-  batch.set(doc(firestore, 'users', context.userId), removeUndefined({
-    id: context.userId,
-    updatedAt: savedAt,
-  }), { merge: true });
+  if (isOwnerWrite) {
+    batch.set(doc(firestore, 'users', context.userId), removeUndefined({
+      id: context.userId,
+      updatedAt: savedAt,
+    }), { merge: true });
 
-  batch.set(journalRef, removeUndefined({
-    id: journalId,
-    name: snapshot.journalName,
-    journalType: snapshot.journalType,
-    ownerId: context.userId,
-    createdAt: snapshot.savedAt,
-    updatedAt: savedAt,
-    savedAt,
-    settings: {
-      version: snapshot.version,
+    batch.set(journalRef, removeUndefined({
+      id: journalId,
+      name: snapshot.journalName,
       journalType: snapshot.journalType,
-      days: snapshot.days,
-      categorySettings: snapshot.categorySettings,
-      disciplineScoreSettings: snapshot.disciplineScoreSettings,
-      exportEmail: snapshot.exportEmail ?? '',
-    },
-    presets: {
-      symbolOptions: snapshot.symbolOptions,
-      assetTypeBySymbol: snapshot.assetTypeBySymbol,
-      screenshotTimeframes: snapshot.screenshotTimeframes,
-      customEmotionOptions: snapshot.customEmotionOptions,
-      customRuleViolationOptions: snapshot.customRuleViolationOptions,
-      customStrategyOptions: snapshot.customStrategyOptions,
-    },
-    accountValueHistory: snapshot.accountValueResets,
-    notifications: snapshot.notifications,
-  }), { merge: true });
+      ownerId: context.userId,
+      createdAt: snapshot.savedAt,
+      updatedAt: savedAt,
+      savedAt,
+      settings: {
+        version: snapshot.version,
+        journalType: snapshot.journalType,
+        days: snapshot.days,
+        categorySettings: snapshot.categorySettings,
+        disciplineScoreSettings: snapshot.disciplineScoreSettings,
+        exportEmail: snapshot.exportEmail ?? '',
+      },
+      presets: {
+        symbolOptions: snapshot.symbolOptions,
+        assetTypeBySymbol: snapshot.assetTypeBySymbol,
+        screenshotTimeframes: snapshot.screenshotTimeframes,
+        customEmotionOptions: snapshot.customEmotionOptions,
+        customRuleViolationOptions: snapshot.customRuleViolationOptions,
+        customStrategyOptions: snapshot.customStrategyOptions,
+      },
+      accountValueHistory: snapshot.accountValueResets,
+      notifications: snapshot.notifications,
+    }), { merge: true });
+  } else {
+    if (context.sharePermission !== 'edit') {
+      console.info(logPrefix, 'write skipped: shared journal is view-only', {
+        userId: context.userId,
+        ownerId,
+        journalId,
+        shareCode: context.shareCode,
+      });
+      return;
+    }
+
+    batch.set(journalRef, removeUndefined({
+      updatedAt: savedAt,
+      savedAt,
+      settings: {
+        days: snapshot.days,
+      },
+    }), { merge: true });
+  }
 
   existingEntries.docs.forEach((entryDoc) => {
     batch.delete(entryDoc.ref);
@@ -263,6 +420,7 @@ async function saveFirebaseSnapshot(snapshot: JournalSnapshot) {
   await batch.commit();
   console.info(logPrefix, 'write success', {
     userId: context.userId,
+    ownerId,
     journalId,
     journalPath: journalRef.path,
     entriesPath: entriesRef.path,
@@ -311,10 +469,12 @@ function subscribeFirebaseSnapshot(onChange: (snapshot: JournalSnapshot) => void
   }
 
   const journalId = context.journalId;
-  const journalRef = getJournalRef(context.userId, journalId);
+  const ownerId = getEffectiveOwnerId();
+  const journalRef = getJournalRef(ownerId, journalId);
   const entriesRef = collection(journalRef, 'entries');
   console.info(logPrefix, 'listener start', {
     userId: context.userId,
+    ownerId,
     journalId,
     journalPath: journalRef.path,
     entriesPath: entriesRef.path,
@@ -332,6 +492,7 @@ function subscribeFirebaseSnapshot(onChange: (snapshot: JournalSnapshot) => void
     const snapshot = buildSnapshotFromFirebase(journalId, journalData, entryDocs);
     console.info(logPrefix, 'realtime snapshot received', {
       userId: context.userId,
+      ownerId,
       journalId,
       entriesPath: entriesRef.path,
       tasks: Object.keys(snapshot.tasks).length,
@@ -378,7 +539,7 @@ function subscribeFirebaseSnapshot(onChange: (snapshot: JournalSnapshot) => void
 export async function clearFirebaseSnapshot() {
   if (!firestore || !context.userId) return;
 
-  const journalRef = getJournalRef(context.userId, context.journalId);
+  const journalRef = getJournalRef(getEffectiveOwnerId(), context.journalId);
   const entriesSnapshot = await getDocs(collection(journalRef, 'entries'));
 
   await Promise.all([
@@ -465,6 +626,10 @@ function getJournalRef(userId: string, journalId: string) {
   return doc(firestore!, 'users', userId, 'journals', journalId || defaultJournalId);
 }
 
+function getEffectiveOwnerId() {
+  return context.ownerId || context.userId || '';
+}
+
 function buildPaths(userId: string | undefined, journalId: string) {
   const journalPath = userId ? `users/${userId}/journals/${journalId}` : `users/{userId}/journals/${journalId}`;
 
@@ -490,6 +655,28 @@ function isEntryDocument(value: unknown): value is EntryDocument {
 
 function isValidJournalId(value: string) {
   return Boolean(value && !value.includes('/') && value !== '.' && value !== '..');
+}
+
+function isValidUserId(value: string) {
+  return Boolean(value && !value.includes('/') && value !== '.' && value !== '..');
+}
+
+function isValidShareCode(value: string) {
+  return /^TRD-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(value);
+}
+
+async function createUniqueShareCode() {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const shareCode = `TRD-${randomCodePart()}-${randomCodePart()}`;
+    const existing = await getDoc(doc(firestore!, 'shares', shareCode));
+    if (!existing.exists()) return shareCode;
+  }
+
+  throw new Error('Could not create a unique share code right now.');
+}
+
+function randomCodePart() {
+  return Math.random().toString(36).slice(2, 6).toUpperCase().replace(/[^A-Z0-9]/g, 'X').padEnd(4, 'X');
 }
 
 function removeUndefined<T>(value: T): T {

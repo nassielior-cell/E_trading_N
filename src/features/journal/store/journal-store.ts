@@ -32,7 +32,7 @@ import {
   type JournalSummary,
   type JournalSnapshot,
 } from '../data/journal-repository';
-import { firebaseJournalRepository } from '../data/firebase-journal-repository';
+import { firebaseJournalRepository, type JournalShareRecord, type SharePermission } from '../data/firebase-journal-repository';
 import { buildDayMetadata } from '../utils/day-metadata';
 import { buildDisciplineSnapshot } from '../utils/discipline';
 import { normalizeAssetName, normalizeAssetType, normalizeDateKey, normalizeTradeMode } from '../utils/trade-values';
@@ -139,8 +139,11 @@ type JournalState = {
   journals: JournalSummary[];
   exportEmail: string;
   accessMode: 'owner' | 'viewer';
+  sharePermission?: SharePermission;
+  sharedOwnerId?: string;
+  shareCode?: string;
   isViewOnly: boolean;
-  setAccessMode: (mode: 'owner' | 'viewer') => void;
+  createShareLink: (permission: SharePermission) => Promise<JournalShareRecord>;
   updateJournalName: (name: string) => void;
   updateJournalType: (journalType: JournalType) => void;
   createNewJournal: (name: string, journalType?: JournalType) => void;
@@ -164,6 +167,7 @@ type JournalState = {
     | 'journalType'
   >;
   initializeCloudSync: (userId?: string, journalId?: string, options?: { createIfMissing?: boolean }) => Promise<boolean>;
+  initializeSharedJournal: (userId: string, shareCode: string) => Promise<boolean>;
   resetCloudJournalState: (userId?: string) => void;
   addTask: (input: AddTaskInput) => void;
   addTrade: (input: AddTradeInput) => void;
@@ -266,17 +270,15 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   journals: initialSnapshot.journals,
   exportEmail: initialSnapshot.exportEmail ?? '',
   accessMode: 'owner',
+  sharePermission: undefined,
+  sharedOwnerId: undefined,
+  shareCode: undefined,
   isViewOnly: false,
 
-  setAccessMode: (mode) => {
-    set((state) => {
-      const isViewOnly = mode === 'viewer';
-      if (state.accessMode === mode && state.isViewOnly === isViewOnly) return state;
-      return { accessMode: mode, isViewOnly };
-    });
-  },
+  createShareLink: (permission) => firebaseJournalRepository.createShare(permission, get().workspaceId),
 
   updateJournalName: (name) => {
+    if (get().accessMode !== 'owner') return;
     const nextName = name.trim() || 'E_trading_N Journal';
     if (get().journalName === nextName) return;
     set((state) => ({
@@ -287,6 +289,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   updateJournalType: (journalType) => {
+    if (get().accessMode !== 'owner') return;
     const nextJournalType = normalizeJournalType(journalType);
     if (get().journalType === nextJournalType) return;
     set((state) => ({
@@ -297,6 +300,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   createNewJournal: (name, journalType = 'combined') => {
+    if (get().accessMode !== 'owner') return;
     const currentSnapshot = storeStateToSnapshot(get());
     saveJournalWorkspaceSnapshot(currentSnapshot);
     const nextWorkspaceId = `journal_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -362,6 +366,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
 
   switchJournal: (nextWorkspaceId) => {
     const state = get();
+    if (state.accessMode !== 'owner') return;
     if (nextWorkspaceId === state.workspaceId) return;
 
     const currentSnapshot = storeStateToSnapshot(state);
@@ -393,6 +398,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
 
   deleteCurrentJournal: async () => {
     const state = get();
+    if (state.accessMode !== 'owner') return state.journals;
     const deletedWorkspaceId = state.workspaceId;
     const remainingLocalJournals = withoutJournal(state.journals, deletedWorkspaceId);
 
@@ -438,6 +444,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   updateExportEmail: (email) => {
+    if (get().accessMode !== 'owner') return;
     set((state) => ({
       exportEmail: email,
       events: [createJournalEvent('settings_changed', { setting: 'export_email' }), ...state.events].slice(0, 100),
@@ -506,6 +513,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
 
     if (userId) {
       firebaseJournalRepository.setUser(userId);
+      firebaseJournalRepository.clearSharedJournal();
     } else {
       firebaseJournalRepository.clearUser();
     }
@@ -531,7 +539,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
     hasInitializedCloudSync = true;
     initializedCloudUserId = userId;
     initializedCloudJournalId = firebaseJournalRepository.workspaceId;
-    set({ syncStatus: 'syncing', syncMessage: 'Loaded cache; checking Firestore', dataSource: 'localStorage' });
+    set({ syncStatus: 'syncing', syncMessage: 'Loaded cache; checking Firestore', dataSource: 'localStorage', accessMode: 'owner', isViewOnly: false, sharePermission: undefined, sharedOwnerId: undefined, shareCode: undefined });
 
     try {
       const localSnapshot = storeStateToSnapshot(get());
@@ -726,6 +734,137 @@ export const useJournalStore = create<JournalState>((set, get) => ({
     }
   },
 
+  initializeSharedJournal: async (userId, shareCode) => {
+    console.info('[journal-store-sync]', 'shared initialize requested', {
+      userId,
+      shareCode,
+      isConfigured: firebaseJournalRepository.isConfigured,
+    });
+
+    if (!firebaseJournalRepository.isConfigured || !userId) {
+      set({ syncStatus: 'setup_required', syncMessage: 'Sign in required for shared journals', dataSource: 'fallback' });
+      return false;
+    }
+
+    const normalizedShareCode = shareCode.trim().toUpperCase();
+    if (!isValidShareCode(normalizedShareCode)) {
+      set({ syncStatus: 'error', syncMessage: 'Invalid share link.', dataSource: 'fallback', accessMode: 'owner', isViewOnly: false, sharePermission: undefined, sharedOwnerId: undefined, shareCode: undefined });
+      return false;
+    }
+
+    firebaseJournalRepository.setUser(userId);
+    set({ syncStatus: 'syncing', syncMessage: 'Opening shared journal', dataSource: 'Firebase', accessMode: 'owner', isViewOnly: false, sharePermission: undefined, sharedOwnerId: undefined, shareCode: undefined });
+
+    try {
+      const share = await firebaseJournalRepository.resolveShare(normalizedShareCode);
+      if (!share) {
+        set({ syncStatus: 'error', syncMessage: 'Shared journal link was not found.', dataSource: 'fallback', accessMode: 'owner', isViewOnly: false, sharePermission: undefined, sharedOwnerId: undefined, shareCode: undefined });
+        return false;
+      }
+
+      if (share.ownerId === userId) {
+        firebaseJournalRepository.clearSharedJournal();
+        return get().initializeCloudSync(userId, share.journalId);
+      }
+
+      await firebaseJournalRepository.claimShare(share);
+      firebaseJournalRepository.setSharedJournal(share);
+      stopCloudSubscription();
+      hasInitializedCloudSync = true;
+      initializedCloudUserId = userId;
+      initializedCloudJournalId = share.journalId;
+      activeCloudLoadRequestId += 1;
+
+      const sharedSnapshot = await firebaseJournalRepository.load(share.journalId);
+      if (!sharedSnapshot) {
+        set({ syncStatus: 'error', syncMessage: 'Shared journal could not be opened.', dataSource: 'fallback', accessMode: 'owner', isViewOnly: false, sharePermission: undefined, sharedOwnerId: undefined, shareCode: undefined });
+        return false;
+      }
+
+      const snapshotWithSingleJournal = {
+        ...sharedSnapshot,
+        journals: [{
+          workspaceId: share.journalId,
+          name: sharedSnapshot.journalName,
+          savedAt: sharedSnapshot.savedAt,
+          journalType: sharedSnapshot.journalType,
+        }],
+      };
+      const canEdit = share.permission === 'edit';
+
+      isApplyingRemoteSnapshot = true;
+      try {
+        set({
+          ...snapshotToStoreState(snapshotWithSingleJournal),
+          syncStatus: 'cloud',
+          syncMessage: canEdit ? `Shared edit access ${formatSyncTime()}` : `Shared view-only access ${formatSyncTime()}`,
+          lastSyncedAt: new Date().toISOString(),
+          dataSource: 'Firebase',
+          firestorePath: firebaseJournalRepository.paths.entries,
+          accessMode: 'viewer',
+          isViewOnly: !canEdit,
+          sharePermission: share.permission,
+          sharedOwnerId: share.ownerId,
+          shareCode: share.shareCode,
+          events: [],
+        });
+      } finally {
+        isApplyingRemoteSnapshot = false;
+      }
+
+      replaceCloudSubscription(
+        (snapshot) => {
+          isApplyingRemoteSnapshot = true;
+          try {
+            useJournalStore.setState({
+              ...snapshotToStoreState({
+                ...snapshot,
+                journals: useJournalStore.getState().journals,
+              }),
+              syncStatus: 'cloud',
+              syncMessage: `Shared realtime update ${formatSyncTime()}`,
+              lastSyncedAt: new Date().toISOString(),
+              dataSource: 'Firebase',
+              firestorePath: firebaseJournalRepository.paths.entries,
+              accessMode: 'viewer',
+              isViewOnly: share.permission !== 'edit',
+              sharePermission: share.permission,
+              sharedOwnerId: share.ownerId,
+              shareCode: share.shareCode,
+            });
+          } finally {
+            isApplyingRemoteSnapshot = false;
+          }
+        },
+        (error) => {
+          console.error('[journal-store-sync]', 'Shared Firestore realtime listener error', error);
+          useJournalStore.setState((state) => ({
+            syncStatus: 'error',
+            syncMessage: 'Shared journal sync error.',
+            dataSource: 'fallback',
+            notifications: [createSyncErrorNotification('Shared journal sync failed.'), ...state.notifications].slice(0, 100),
+          }));
+        },
+      );
+
+      return true;
+    } catch (error) {
+      console.error('[journal-store-sync]', 'Shared journal initialization error', error);
+      set((state) => ({
+        syncStatus: 'error',
+        syncMessage: 'Shared journal could not be opened.',
+        dataSource: 'fallback',
+        accessMode: 'owner',
+        isViewOnly: false,
+        sharePermission: undefined,
+        sharedOwnerId: undefined,
+        shareCode: undefined,
+        notifications: [createSyncErrorNotification('Shared journal could not be opened.'), ...state.notifications].slice(0, 100),
+      }));
+      return false;
+    }
+  },
+
   resetCloudJournalState: (userId) => {
     stopCloudSubscription();
     hasInitializedCloudSync = false;
@@ -736,6 +875,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
     cloudSnapshotCache.clear();
     if (userId) {
       firebaseJournalRepository.setUser(userId);
+      firebaseJournalRepository.clearSharedJournal();
     } else {
       firebaseJournalRepository.clearUser();
     }
@@ -759,6 +899,11 @@ export const useJournalStore = create<JournalState>((set, get) => ({
         firestorePath: firebaseJournalRepository.paths.entries,
         events: [],
         notifications: [],
+        accessMode: 'owner',
+        isViewOnly: false,
+        sharePermission: undefined,
+        sharedOwnerId: undefined,
+        shareCode: undefined,
       });
     } finally {
       isApplyingRemoteSnapshot = false;
@@ -766,6 +911,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   addTask: (input) => {
+    if (get().isViewOnly) return;
     const now = getNow();
     const id = createId('task');
 
@@ -811,6 +957,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   updateTask: (id, input) => {
+    if (get().isViewOnly) return;
     const now = getNow();
 
     set((state) => {
@@ -854,6 +1001,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   addTrade: (input) => {
+    if (get().isViewOnly) return;
     const now = getNow();
     const id = createId('trade');
 
@@ -949,6 +1097,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   updateTrade: (id, input) => {
+    if (get().isViewOnly) return;
     const now = getNow();
 
     set((state) => {
@@ -1067,6 +1216,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   addSpot: (input) => {
+    if (get().isViewOnly) return;
     const now = getNow();
     const id = createId('spot');
 
@@ -1180,6 +1330,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   updateSpot: (id, input) => {
+    if (get().isViewOnly) return;
     const now = getNow();
 
     set((state) => {
@@ -1256,6 +1407,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   addSpotSell: (id, input) => {
+    if (get().isViewOnly) return;
     const now = getNow();
 
     set((state) => {
@@ -1329,6 +1481,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   addSymbolOption: (symbol, assetType = 'crypto') => {
+    if (get().accessMode !== 'owner') return;
     const normalizedSymbol = normalizeAssetName(symbol).replace(/[^A-Z0-9]/g, '');
     const normalizedAssetType = normalizeAssetType(assetType, normalizedSymbol);
 
@@ -1346,6 +1499,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
 
   addScreenshotTimeframe: (timeframe) => {
+    if (get().accessMode !== 'owner') return;
     const normalizedTimeframe = timeframe.trim();
 
     if (!normalizedTimeframe) {
@@ -1364,6 +1518,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
     });
   },
   addCustomEmotion: (value) => {
+    if (get().accessMode !== 'owner') return;
     const normalized = normalizePreset(value);
     if (!normalized) return;
     set((state) => ({
@@ -1374,6 +1529,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
     }));
   },
   addCustomRuleViolation: (value) => {
+    if (get().accessMode !== 'owner') return;
     const normalized = normalizePreset(value);
     if (!normalized) return;
     set((state) => ({
@@ -1384,6 +1540,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
     }));
   },
   addCustomStrategy: (value) => {
+    if (get().accessMode !== 'owner') return;
     const normalized = normalizePreset(value);
     if (!normalized) return;
     set((state) => ({
@@ -1394,12 +1551,14 @@ export const useJournalStore = create<JournalState>((set, get) => ({
     }));
   },
   updateDisciplineScoreSettings: (settings) => {
+    if (get().accessMode !== 'owner') return;
     set((state) => ({
       events: [createJournalEvent('settings_changed', { setting: 'discipline_score' }), ...state.events].slice(0, 100),
       disciplineScoreSettings: settings,
     }));
   },
   addAccountValueChange: (input) => {
+    if (get().accessMode !== 'owner') return;
     if (!Number.isFinite(input.value)) return;
 
     const change: AccountValueReset = {
@@ -1417,6 +1576,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
     }));
   },
   clearLocalJournalData: () => {
+    if (get().accessMode !== 'owner') return;
     const state = get();
     const resetSnapshot = createResetJournalSnapshot(state);
     journalRepository.save(resetSnapshot);
@@ -1430,6 +1590,7 @@ export const useJournalStore = create<JournalState>((set, get) => ({
   },
   exportJournalJson: () => journalRepository.exportJson(storeStateToSnapshot(get())),
   importJournalJson: (json) => {
+    if (get().accessMode !== 'owner') return;
     const snapshot = journalRepository.importJson(json);
     const event = createJournalEvent('settings_changed', { source: 'json_import' });
     set((state) => ({ ...snapshotToStoreState(snapshot), events: [event, ...state.events].slice(0, 100) }));
@@ -1781,17 +1942,31 @@ function replaceCloudSubscription(
 useJournalStore.subscribe((state, previousState) => {
   const snapshot = storeStateToSnapshot(state);
   const previousSnapshot = storeStateToSnapshot(previousState);
+  const isSharedSession = Boolean(state.sharedOwnerId && state.sharePermission);
 
   if (snapshotFingerprint(snapshot) === snapshotFingerprint(previousSnapshot)) {
     return;
   }
 
-  journalRepository.save(snapshot);
+  if (!isSharedSession) {
+    journalRepository.save(snapshot);
+  }
 
   if (state.syncStatus !== 'cloud' || isApplyingRemoteSnapshot) {
     if (isApplyingRemoteSnapshot) {
-      console.info('[journal-store-sync]', 'localStorage cache updated from Firebase snapshot');
+      console.info('[journal-store-sync]', isSharedSession
+        ? 'shared snapshot applied without touching personal localStorage cache'
+        : 'localStorage cache updated from Firebase snapshot');
     }
+    return;
+  }
+
+  if (isSharedSession && state.sharePermission !== 'edit') {
+    console.info('[journal-store-sync]', 'cloud write skipped for shared view-only session', {
+      sharedOwnerId: state.sharedOwnerId,
+      workspaceId: snapshot.workspaceId,
+      shareCode: state.shareCode,
+    });
     return;
   }
 
@@ -1963,6 +2138,10 @@ function withoutJournal(journals: JournalSummary[], workspaceId: string) {
 
 function isValidJournalId(value: string) {
   return Boolean(value && !value.includes('/') && value !== '.' && value !== '..');
+}
+
+function isValidShareCode(value: string) {
+  return /^TRD-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(value);
 }
 
 function normalizePreset(value: string) {

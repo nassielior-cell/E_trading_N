@@ -1,0 +1,99 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(ownerId) {
+      return signedIn() && request.auth.uid == ownerId;
+    }
+
+    function grantPath(ownerId, journalId) {
+      return /databases/$(database)/documents/users/$(ownerId)/journals/$(journalId)/accessGrants/$(request.auth.uid);
+    }
+
+    function hasGrant(ownerId, journalId) {
+      return signedIn() && exists(grantPath(ownerId, journalId));
+    }
+
+    function grantPermission(ownerId, journalId) {
+      return get(grantPath(ownerId, journalId)).data.permission;
+    }
+
+    function canReadJournal(ownerId, journalId) {
+      return isOwner(ownerId) || hasGrant(ownerId, journalId);
+    }
+
+    function canEditJournalEntries(ownerId, journalId) {
+      return isOwner(ownerId) || (hasGrant(ownerId, journalId) && grantPermission(ownerId, journalId) == 'edit');
+    }
+
+    function sharePath(shareCode) {
+      return /databases/$(database)/documents/shares/$(shareCode);
+    }
+
+    function validShareClaim(ownerId, journalId) {
+      return signedIn()
+        && request.resource.data.keys().hasOnly(['viewerId', 'ownerId', 'journalId', 'shareCode', 'permission', 'createdAt', 'updatedAt'])
+        && request.resource.data.viewerId == request.auth.uid
+        && request.resource.data.ownerId == ownerId
+        && request.resource.data.journalId == journalId
+        && request.resource.data.shareCode is string
+        && exists(sharePath(request.resource.data.shareCode))
+        && get(sharePath(request.resource.data.shareCode)).data.ownerId == ownerId
+        && get(sharePath(request.resource.data.shareCode)).data.journalId == journalId
+        && get(sharePath(request.resource.data.shareCode)).data.active == true
+        && get(sharePath(request.resource.data.shareCode)).data.permission in ['view', 'edit']
+        && request.resource.data.permission == get(sharePath(request.resource.data.shareCode)).data.permission;
+    }
+
+    match /shares/{shareCode} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['shareCode', 'ownerId', 'journalId', 'permission', 'sharedWith', 'createdAt', 'updatedAt', 'active', 'createdBy'])
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.journalId is string
+        && request.resource.data.permission in ['view', 'edit']
+        && request.resource.data.active == true
+        && request.resource.data.shareCode == shareCode;
+      allow update, delete: if signedIn() && resource.data.ownerId == request.auth.uid;
+    }
+
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      match /journals/{journalId} {
+        allow read: if canReadJournal(userId, journalId);
+        allow create, delete: if isOwner(userId);
+        allow update: if isOwner(userId)
+          || (
+            canEditJournalEntries(userId, journalId)
+            && request.resource.data.ownerId == resource.data.ownerId
+            && request.resource.data.id == resource.data.id
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['settings', 'updatedAt', 'savedAt'])
+            && request.resource.data.settings.diff(resource.data.settings).affectedKeys().hasOnly(['days'])
+          );
+
+        match /entries/{entryId} {
+          allow read: if canReadJournal(userId, journalId);
+          allow create, update, delete: if canEditJournalEntries(userId, journalId);
+        }
+
+        match /accessGrants/{viewerId} {
+          allow read: if isOwner(userId) || (signedIn() && request.auth.uid == viewerId);
+          allow create, update: if signedIn()
+            && request.auth.uid == viewerId
+            && validShareClaim(userId, journalId);
+          allow delete: if isOwner(userId) || (signedIn() && request.auth.uid == viewerId);
+        }
+      }
+    }
+
+    match /workspaces/{workspaceId}/settings/{docId} {
+      allow read, write: if signedIn();
+    }
+  }
+}

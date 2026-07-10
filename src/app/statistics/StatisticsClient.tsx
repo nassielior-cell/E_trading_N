@@ -106,7 +106,10 @@ export function StatisticsClient() {
   const accountValueResets = useJournalStore((state) => state.accountValueResets);
   const journalType = useJournalStore((state) => state.journalType);
   const assetTypeBySymbol = useJournalStore((state) => state.assetTypeBySymbol);
+  const isViewOnly = useJournalStore((state) => state.isViewOnly);
+  const shareCode = useJournalStore((state) => state.shareCode);
   const initializeCloudSync = useJournalStore((state) => state.initializeCloudSync);
+  const initializeSharedJournal = useJournalStore((state) => state.initializeSharedJournal);
   const [filters, setFilters] = useState<Filters>(initialFilters);
   const [selectedGroup, setSelectedGroup] = useState<StatRow | null>(null);
   const [tradeToEdit, setTradeToEdit] = useState<Trade | undefined>();
@@ -120,9 +123,16 @@ export function StatisticsClient() {
 
   useEffect(() => {
     if (!isAuthReady || !user) return;
-    const requestedWorkspace = new URLSearchParams(window.location.search).get('workspace') ?? undefined;
+    const params = new URLSearchParams(window.location.search);
+    const shareCode = params.get('shareCode');
+    if (shareCode) {
+      void initializeSharedJournal(user.uid, shareCode);
+      return;
+    }
+
+    const requestedWorkspace = params.get('workspace') ?? undefined;
     void initializeCloudSync(user.uid, requestedWorkspace);
-  }, [initializeCloudSync, isAuthReady, user]);
+  }, [initializeCloudSync, initializeSharedJournal, isAuthReady, user]);
   const strategyLabelById = useMemo(() => {
     const defaultLabels = Object.fromEntries(strategyOptions.map((option) => [option.value, t(option.labelKey)]));
     const customLabels = Object.fromEntries(customStrategyOptions.map((value) => [value, value.replace(/_/g, ' ')]));
@@ -297,7 +307,9 @@ export function StatisticsClient() {
           </div>
           <Link
             className="inline-flex min-h-10 items-center justify-center rounded-md bg-muted px-4 py-2 text-sm font-semibold text-ink transition hover:bg-border"
-            href="/"
+            href={shareCode
+              ? `/?shareCode=${encodeURIComponent(shareCode)}`
+              : '/'}
           >
             {t('workspace')}
           </Link>
@@ -376,8 +388,11 @@ export function StatisticsClient() {
           <StatCard label={isHebrew ? 'שווי תיק נוכחי' : 'Current account value'} value={formatAccountValue(currentAccountValue?.value)} />
           <button
             className="rounded-md border border-border bg-muted p-3 text-start transition hover:bg-border disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={!largestLossTrade}
-            onClick={() => setTradeToEdit(largestLossTrade)}
+            disabled={!largestLossTrade || isViewOnly}
+            onClick={() => {
+              if (isViewOnly) return;
+              setTradeToEdit(largestLossTrade);
+            }}
             type="button"
           >
             <span className="block text-xs font-bold uppercase text-subtle">{largestLossTrade ? largestLossTrade.entryDate : '-'}</span>
@@ -426,6 +441,7 @@ export function StatisticsClient() {
                 className="grid gap-1 rounded-md border border-border bg-surface p-3 text-start text-sm transition hover:bg-muted"
                 key={trade.id}
                 onClick={() => {
+                  if (isViewOnly) return;
                   setSelectedGroup(null);
                   setTradeToEdit(trade);
                 }}

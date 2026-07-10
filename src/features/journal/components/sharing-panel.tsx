@@ -1,12 +1,13 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import { Modal } from '@/components/ui/modal';
 import { useLanguage } from '@/lib/i18n/language-provider';
 import { officialPublicUrl } from '@/lib/public-url';
 
+import type { SharePermission } from '../data/firebase-journal-repository';
 import { useJournalStore } from '../store/journal-store';
 
 type SharingPanelProps = {
@@ -20,23 +21,52 @@ export function SharingPanel({ isOpen, onClose }: SharingPanelProps) {
   const { language, t } = useLanguage();
   const workspaceId = useJournalStore((state) => state.workspaceId);
   const accessMode = useJournalStore((state) => state.accessMode);
-  const setAccessMode = useJournalStore((state) => state.setAccessMode);
+  const currentShareCode = useJournalStore((state) => state.shareCode);
+  const sharedOwnerId = useJournalStore((state) => state.sharedOwnerId);
+  const createShareLink = useJournalStore((state) => state.createShareLink);
   const createEmptyTemplateSnapshot = useJournalStore((state) => state.createEmptyTemplateSnapshot);
   const [copyMessage, setCopyMessage] = useState('');
+  const [shareLink, setShareLink] = useState('');
+  const [sharePermission, setSharePermission] = useState<SharePermission>('view');
+  const [isCreatingShare, setIsCreatingShare] = useState(false);
   const [templateCode, setTemplateCode] = useState('');
   const [templateMessage, setTemplateMessage] = useState('');
   const isHebrew = language === 'he';
-  const shareLink = useMemo(() => {
+
+  const buildShareUrl = (shareCode: string) => {
     const url = new URL('/', officialPublicUrl);
     url.pathname = '/';
-    url.searchParams.set('mode', 'viewer');
-    url.searchParams.set('workspace', workspaceId);
+    url.searchParams.set('shareCode', shareCode);
     return url.toString();
-  }, [workspaceId]);
+  };
+
+  const createLink = async () => {
+    if (accessMode !== 'owner') {
+      setCopyMessage(isHebrew ? 'רק בעל היומן יכול ליצור קישור שיתוף.' : 'Only the journal owner can create a share link.');
+      return '';
+    }
+
+    setIsCreatingShare(true);
+    try {
+      const share = await createShareLink(sharePermission);
+      const nextLink = buildShareUrl(share.shareCode);
+      setShareLink(nextLink);
+      setCopyMessage(isHebrew ? 'קישור שיתוף נוצר.' : 'Share link created.');
+      return nextLink;
+    } catch (error) {
+      setCopyMessage(error instanceof Error ? error.message : isHebrew ? 'לא ניתן ליצור קישור כרגע.' : 'Could not create a share link right now.');
+      return '';
+    } finally {
+      setIsCreatingShare(false);
+    }
+  };
 
   const copyLink = async () => {
+    const linkToCopy = await createLink();
+    if (!linkToCopy) return;
+
     try {
-      await navigator.clipboard.writeText(shareLink);
+      await navigator.clipboard.writeText(linkToCopy);
       setCopyMessage(isHebrew ? 'הקישור הועתק' : 'Link copied');
     } catch {
       setCopyMessage(isHebrew ? 'לא ניתן להעתיק כרגע' : 'Could not copy link');
@@ -75,21 +105,25 @@ export function SharingPanel({ isOpen, onClose }: SharingPanelProps) {
     setTemplateMessage(isHebrew ? 'קובץ תבנית ריק נוצר להורדה.' : 'Empty template file is ready.');
   };
 
+  const displayedShareLink = shareLink || (currentShareCode ? buildShareUrl(currentShareCode) : '-');
+
   return (
     <Modal closeLabel={t('close')} isOpen={isOpen} onClose={onClose} title={isHebrew ? 'שיתוף' : 'Sharing'}>
       <div className="grid gap-4">
         <section className="grid gap-3 rounded-md border border-border bg-muted p-3 text-sm">
-          <Info label={isHebrew ? 'קישור שיתוף בפועל' : 'Actual share link'} value={shareLink || '-'} />
-          <Info label={isHebrew ? 'מצב' : 'Mode'} value={accessMode === 'viewer' ? (isHebrew ? 'צפייה בלבד' : 'View only') : (isHebrew ? 'בעלים' : 'Owner')} />
+          <Info label={isHebrew ? 'קישור שיתוף בפועל' : 'Actual share link'} value={displayedShareLink} />
+          <Info label={isHebrew ? 'יומן' : 'Journal'} value={sharedOwnerId ? `${sharedOwnerId}/${workspaceId}` : workspaceId} />
+          <Info label={isHebrew ? 'הרשאה' : 'Permission'} value={sharePermission === 'edit' ? (isHebrew ? 'עריכה' : 'Edit') : (isHebrew ? 'צפייה בלבד' : 'View only')} />
           <p className="text-sm font-semibold text-subtle">
             {isHebrew
-              ? 'העתק את הקישור ושלח אותו. המקבל פותח את הקישור בדפדפן ויכול לצפות בלבד. עריכה דרך קישור כבויה עד שיהיה אימות והרשאות.'
-              : 'Test instructions: copy the link, open it in a private window or another browser, and confirm view-only mode is visible. The receiver sees this journal by workspace id. Edit access by link stays disabled until authentication and permissions exist.'}
+              ? 'הקישור כולל קוד שיתוף אמיתי, ולכן הוא פותח את היומן של הבעלים המקורי ולא את היומן האישי של הצופה.'
+              : 'The link contains a real share code, so it opens the original owner journal while the receiver stays signed in to their own account.'}
           </p>
           <div className="flex flex-wrap gap-2">
-            <Button onClick={copyLink} type="button" variant="secondary">{isHebrew ? 'העתקת קישור' : 'Copy link'}</Button>
-            <Button onClick={() => setAccessMode('viewer')} type="button" variant={accessMode === 'viewer' ? 'primary' : 'secondary'}>{isHebrew ? 'ברירת מחדל: צפייה בלבד' : 'Default: view only'}</Button>
-            <Button disabled type="button" variant="secondary">{isHebrew ? 'עריכה כבויה כרגע' : 'Edit mode disabled'}</Button>
+            <Button disabled={isCreatingShare || accessMode !== 'owner'} onClick={createLink} type="button" variant="secondary">{isHebrew ? 'יצירת קישור' : 'Create link'}</Button>
+            <Button disabled={isCreatingShare || accessMode !== 'owner'} onClick={copyLink} type="button" variant="secondary">{isHebrew ? 'העתקת קישור' : 'Copy link'}</Button>
+            <Button disabled={accessMode !== 'owner'} onClick={() => setSharePermission('view')} type="button" variant={sharePermission === 'view' ? 'primary' : 'secondary'}>{isHebrew ? 'צפייה בלבד' : 'View only'}</Button>
+            <Button disabled={accessMode !== 'owner'} onClick={() => setSharePermission('edit')} type="button" variant={sharePermission === 'edit' ? 'primary' : 'secondary'}>{isHebrew ? 'עריכה' : 'Edit'}</Button>
           </div>
           {copyMessage ? <p className="text-sm font-bold text-ink">{copyMessage}</p> : null}
         </section>
